@@ -245,6 +245,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 is_test=True,
                 save_samples=self.cfg.general.save_samples,
                 save_visualization=True,
+                return_attn=self.cfg.sample.return_attn,
             )
             to_log = self.evaluate_samples(samples=samples, labels=labels, is_test=True)
 
@@ -259,7 +260,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
             self.print("Finished testing.")
 
-    def sample(self, is_test, save_samples, save_visualization):
+    def sample(self, is_test, save_samples, save_visualization, return_attn=False):
 
         # Load generated samples if they exist
         if self.cfg.general.generated_path:
@@ -312,6 +313,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 keep_chain=chains_save,
                 number_chain_steps=num_chain_steps,
                 save_visualization=save_visualization,
+                return_attn=return_attn,
             )
             samples.extend(cur_samples)
             labels.extend(cur_labels)
@@ -449,11 +451,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         return noisy_data
 
-    def forward(self, noisy_data, extra_data, node_mask):
+    def forward(self, noisy_data, extra_data, node_mask, return_attn=False):
         X = torch.cat((noisy_data["X_t"], extra_data.X), dim=2).float()
         E = torch.cat((noisy_data["E_t"], extra_data.E), dim=3).float()
         y = torch.hstack((noisy_data["y_t"], extra_data.y)).float()
-        return self.model(X, E, y, node_mask)
+        return self.model(X, E, y, node_mask, return_attn=return_attn)
 
     @torch.no_grad()
     def sample_batch(
@@ -465,6 +467,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         save_final: int,
         num_nodes=None,
         save_visualization: bool = True,
+        return_attn: bool = False,
     ):
         """
         :param batch_id: int
@@ -549,14 +552,33 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             )
 
             # Sample z_s
-            sampled_s, discrete_sampled_s = self.sample_p_zs_given_zt(
-                t_norm,
-                s_norm,
-                X,
-                E,
-                y,
-                node_mask,
-            )
+            if return_attn:
+                sampled_s, discrete_sampled_s, attn_maps = self.sample_p_zs_given_zt(
+                    t_norm,
+                    s_norm,
+                    X,
+                    E,
+                    y,
+                    node_mask,
+                    return_attn=True,
+                )
+                # Save attention map for timestep
+                if not os.path.exists("attention"):
+                    os.makedirs("attention")
+                attn_maps = attn_maps.cpu()
+                filename = f'attention/attn_maps_{batch_id}_{t_int}.pt'
+                with open(filename, 'wb') as f:
+                    pickle.dump(attn_maps, f)
+
+            else:
+                sampled_s, discrete_sampled_s = self.sample_p_zs_given_zt(
+                    t_norm,
+                    s_norm,
+                    X,
+                    E,
+                    y,
+                    node_mask,
+                )
 
             X, E, y = sampled_s.X, sampled_s.E, sampled_s.y
 
@@ -669,6 +691,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         E_t,
         y_t,
         node_mask,
+        return_attn=False
         # , condition
     ):
         """Samples from zs ~ p(zs | zt). Only used during sampling.
@@ -687,7 +710,12 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         }
 
         extra_data = self.compute_extra_data(noisy_data)
-        pred = self.forward(noisy_data, extra_data, node_mask)
+        if return_attn:
+            pred, attn_maps = self.forward(
+                noisy_data, extra_data, node_mask, return_attn=True
+            )
+        else:
+            pred = self.forward(noisy_data, extra_data, node_mask, return_attn=False)
         # Normalize predictions
         pred_X = F.softmax(pred.X, dim=-1)  # bs, n, d0
         pred_E = F.softmax(pred.E, dim=-1)  # bs, n, n, d0
@@ -709,7 +737,12 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             noisy_data["y_t"] = uncond_y
 
             extra_data = self.compute_extra_data(noisy_data)
-            pred = self.forward(noisy_data, extra_data, node_mask)
+            if return_attn:
+                pred, attn_maps = self.forward(
+                    noisy_data, extra_data, node_mask, return_attn=True
+                )
+            else:
+                pred = self.forward(noisy_data, extra_data, node_mask)
 
             pred_X = F.softmax(pred.X, dim=-1)  # bs, n, d0
             pred_E = F.softmax(pred.E, dim=-1)  # bs, n, n, d0
@@ -761,7 +794,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         out_one_hot = out_one_hot.mask(node_mask).type_as(y_t)
         out_discrete = out_discrete.mask(node_mask, collapse=True).type_as(y_t)
 
-        return out_one_hot, out_discrete
+        if return_attn:
+            return out_one_hot, out_discrete, attn_maps
+        else:
+            return out_one_hot, out_discrete
 
     def compute_extra_data(self, noisy_data):
         """At every training step (after adding noise) and step in sampling, compute extra information and append to

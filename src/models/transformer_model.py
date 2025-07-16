@@ -69,7 +69,7 @@ class XEyTransformerLayer(nn.Module):
 
         self.activation = F.relu
 
-    def forward(self, X: Tensor, E: Tensor, y, node_mask: Tensor):
+    def forward(self, X: Tensor, E: Tensor, y, node_mask: Tensor, return_attn=False):
         """Pass the input through the encoder layer.
         X: (bs, n, d)
         E: (bs, n, n, d)
@@ -78,7 +78,13 @@ class XEyTransformerLayer(nn.Module):
         Output: newX, newE, new_y with the same shape.
         """
 
-        newX, newE, new_y = self.self_attn(X, E, y, node_mask=node_mask)
+        out = self.self_attn(X, E, y, node_mask=node_mask, return_attn=return_attn)
+        if return_attn:
+            newX, newE, new_y, attn = out
+        else:
+            newX, newE, new_y = out
+            attn = None
+        # newX, newE, new_y = self.self_attn(X, E, y, node_mask=node_mask)
 
         newX_d = self.dropoutX1(newX)
         X = self.normX1(X + newX_d)
@@ -104,7 +110,7 @@ class XEyTransformerLayer(nn.Module):
         ff_output_y = self.dropout_y3(ff_output_y)
         y = self.norm_y2(y + ff_output_y)
 
-        return X, E, y
+        return X, E, y, attn
 
 
 class NodeEdgeBlock(nn.Module):
@@ -150,7 +156,7 @@ class NodeEdgeBlock(nn.Module):
         self.e_out = Linear(dx, de)
         self.y_out = nn.Sequential(nn.Linear(dy, dy), nn.ReLU(), nn.Linear(dy, dy))
 
-    def forward(self, X, E, y, node_mask):
+    def forward(self, X, E, y, node_mask, return_attn=False):
         """
         :param X: bs, n, d        node features
         :param E: bs, n, n, d     edge features
@@ -239,7 +245,15 @@ class NodeEdgeBlock(nn.Module):
         # newX = self.dropout_X(newX)
         # newE = self.dropout_E(newE)
 
-        return newX, newE, new_y
+        if return_attn:
+            # Reducing to compute attention
+            Y = (Q * K).sum(dim=-1)  # Shape: (bs, n, n, n_head)
+            Y = Y / math.sqrt(Y.size(-1))
+            attn = masked_softmax(Y, softmax_mask, dim=2)
+
+            return newX, newE, new_y, attn
+        else:
+            return newX, newE, new_y
 
 
 class GraphTransformer(nn.Module):
@@ -317,7 +331,7 @@ class GraphTransformer(nn.Module):
             nn.Linear(hidden_mlp_dims["y"], output_dims["y"]),
         )
 
-    def forward(self, X, E, y, node_mask):
+    def forward(self, X, E, y, node_mask, return_attn=False):
         bs, n = X.shape[0], X.shape[1]
 
         diag_mask = torch.eye(n)
@@ -340,8 +354,14 @@ class GraphTransformer(nn.Module):
         ).mask(node_mask)
         X, E, y = after_in.X, after_in.E, after_in.y
 
+        # To collect attention weights
+        attn_maps = []
         for layer in self.tf_layers:
-            X, E, y = layer(X, E, y, node_mask)
+            if return_attn:
+                X, E, y, attn = layer(X, E, y, node_mask, return_attn=True)
+                attn_maps.append(attn)
+            else:
+                X, E, y, _ = layer(X, E, y, node_mask)
 
         X = self.mlp_out_X(X)
         E = self.mlp_out_E(E)
@@ -353,7 +373,10 @@ class GraphTransformer(nn.Module):
 
         E = 1 / 2 * (E + torch.transpose(E, 1, 2))
 
-        return utils.PlaceHolder(X=X, E=E, y=y).mask(node_mask)
+        if return_attn:
+            return utils.PlaceHolder(X=X, E=E, y=y).mask(node_mask), torch.stack(attn_maps, dim=0)
+        else:
+            return utils.PlaceHolder(X=X, E=E, y=y).mask(node_mask)
 
 
 def timestep_embedding(timesteps, dim, max_period=10000):
