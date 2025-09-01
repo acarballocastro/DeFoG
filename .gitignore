@@ -157,3 +157,5 @@ src/timer.dat
 checkpoints
 wandb/
 .vscode/
+
+maps/
